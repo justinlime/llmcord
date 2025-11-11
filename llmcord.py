@@ -1,9 +1,13 @@
 import asyncio
+import os
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
 from typing import Any, Literal, Optional
+
+from flask import Flask, request, render_template_string, send_from_directory
+import threading, asyncio, yaml, os, time, sys
 
 import discord
 from discord.app_commands import Choice
@@ -13,6 +17,107 @@ import httpx
 from openai import AsyncOpenAI
 import yaml
 
+app = Flask(__name__)
+CONFIG_PATH = "config.yaml"
+
+bot_thread = None
+bot_stop = threading.Event()        # signal to stop the bot completely
+bot_restart = threading.Event()     # signal to restart the bot thread
+
+def run_bot_thread():
+    global discord_bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    while not bot_stop.is_set():   # keep running until explicitly stopped
+        try:
+            loop.run_until_complete(discord_bot.start(config["bot_token"]))
+        except Exception as e:
+            print("Bot crashed:", e)
+            time.sleep(30)
+
+        # Check if we need to restart the bot
+        if bot_restart.is_set():
+            bot_restart.clear()
+            loop.run_until_complete(discord_bot.close())
+            # Recreate a fresh bot instance
+            discord_bot = commands.Bot(
+                intents=intents,
+                activity=activity,
+                command_prefix=None
+            )
+
+def start_bot():
+    global bot_thread
+    if bot_thread and bot_thread.is_alive():
+        return
+    bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
+    bot_thread.start()
+
+def restart_bot():
+    print("Restarting bot thread...")
+    bot_restart.set()
+
+def on_save(data):
+    print("Config updated")
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        f.write(data)
+    restart_bot()
+
+@app.route("/", methods=["GET", "POST"])
+def edit():
+    if request.method == "POST":
+        text = request.form["code"]
+        on_save(text)  # pass the editor content directly
+
+    if not os.path.exists(CONFIG_PATH):
+        open(CONFIG_PATH, "w").close()
+
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        code = f.read()
+
+    return render_template_string(''' 
+<!doctype html><html><body style="margin:0">
+<form method="post" style="margin:0;position:relative;height:100vh;overflow:hidden;">
+<div id="editor" style="position:absolute;top:0;bottom:0;left:0;right:0;">{{code}}</div>
+<input type="hidden" name="code" id="code">
+</form>
+
+<button type="button" onclick="submitForm()" style="
+  position:absolute;
+  bottom:20px;
+  right:20px;
+  z-index:10;
+  background-color:#cba6f7;
+  color:#11111B;
+  border:none;
+  border-radius:50px;
+  padding:15px 30px;
+  font-size:1.1em;
+  cursor:pointer;
+  box-shadow:0 4px 10px rgba(0,0,0,0.3);
+  transition:all 0.2s ease;
+"
+onmouseover="this.style.transform='scale(1.05)'"
+onmouseout="this.style.transform='scale(1)'">
+  Save
+</button>
+
+<script src="/static/ace.js"></script>
+<script src="/static/mode-yaml.js"></script>
+<script src="/static/theme-monokai.js"></script>
+<script>
+let e=ace.edit("editor");
+e.setTheme("ace/theme/dracula");
+e.setShowPrintMargin(false);
+e.session.setMode("ace/mode/yaml");
+document.querySelector("form").onsubmit=()=>code.value=e.getValue();
+function submitForm() {
+    document.getElementById("code").value = e.getValue();  // copy editor content
+    document.querySelector("form").submit();              // submit the form
+}
+</script></body></html>''', code=code)
+#############################################################################
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s: %(message)s",
@@ -139,7 +244,11 @@ async def on_message(new_msg: discord.Message) -> None:
         return
 
     provider_slash_model = curr_model
-    provider, model = provider_slash_model.removesuffix(":vision").split("/", 1)
+    parts = provider_slash_model.removesuffix(":vision").split("/", 1)
+    provider = parts[0]
+    model = parts[1] if len(parts) > 1 else ""  # fallback if no '/'
+
+
 
     provider_config = config["providers"][provider]
 
@@ -340,6 +449,7 @@ async def main() -> None:
 
 
 try:
-    asyncio.run(main())
+    start_bot()
+    app.run(host='0.0.0.0', port=5000)
 except KeyboardInterrupt:
     pass
